@@ -1,0 +1,7 @@
+/Desktop/Projects/Raft1 -> javac -d out $(find . -name "*.java")
+cd out -> rmiregistry 1099 &
+/Raft1 -> java -cp out raft.RaftServer 1 1101 3
+          java -cp out raft.RaftServer 2 1102 3
+          java -cp out raft.RaftServer 3 1103 3
+
+
