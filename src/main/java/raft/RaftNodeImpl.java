@@ -2,6 +2,7 @@ package raft;
 
 import log.LogEntry;
 import log.LogHandler;
+import log.SnapshotHandler;
 import rpc.RPCHandler;
 import rpc.RaftNode;
 
@@ -22,14 +23,31 @@ public class RaftNodeImpl extends UnicastRemoteObject implements RaftNode {
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
     private final RPCHandler rpcHandler;
     private final LogHandler logHandler;
+    private final SnapshotHandler snapshotHandler;
     private volatile long lastHeartbeatTime = System.currentTimeMillis();
+    private int lastIncludedIndex = -1;
+    private int lastIncludedTerm = 0;
 
     public RaftNodeImpl(int nodeId, int port, int totalNodes) throws RemoteException {
         this.nodeId = nodeId;
         this.port = port;
         this.totalNodes = totalNodes;
-        this.logHandler = new LogHandler("logs/node" + nodeId + ".txt");  // Initialize log storage
+        this.logHandler = new LogHandler("logs/node" + nodeId + ".txt");
+        this.snapshotHandler = new SnapshotHandler("snapshots/node" + nodeId + ".dat");
         this.rpcHandler = new RPCHandler(totalNodes);
+
+        // Restore from snapshot if available
+        SnapshotHandler.Snapshot snapshot = snapshotHandler.loadSnapshot();
+        if (snapshot != null) {
+            this.lastIncludedIndex = snapshot.lastIncludedIndex;
+            this.lastIncludedTerm = snapshot.lastIncludedTerm;
+            this.data = snapshot.state;
+            logHandler.clearLogs(lastIncludedIndex);
+            System.out.println("🔄 Node " + nodeId + " restored from snapshot at Index=" + lastIncludedIndex);
+        }
+
+        // Start periodic log compaction
+        scheduler.scheduleAtFixedRate(this::createSnapshot, 30, 30, TimeUnit.SECONDS);
 
         // Start leader election with a random delay
         scheduler.schedule(this::startElection, new Random().nextInt(5000), TimeUnit.MILLISECONDS);
@@ -70,12 +88,12 @@ public class RaftNodeImpl extends UnicastRemoteObject implements RaftNode {
     public synchronized void writeData(String newData) throws RemoteException {
         if (isLeader) {
             List<LogEntry> logs = logHandler.readAll();
-            int lastLogIndex = logs.size() - 1;  // Get last log index (-1 if empty)
-            int prevLogIndex = (lastLogIndex >= 0) ? lastLogIndex : -1;
-            int prevLogTerm = (prevLogIndex >= 0) ? logs.get(prevLogIndex).getTerm() : 0; // Default term = 0 if no logs
+            int lastLogIndex = logs.size() - 1;
+            int prevLogIndex = (lastLogIndex >= 0) ? lastLogIndex : lastIncludedIndex;
+            int prevLogTerm = (prevLogIndex >= 0) ? logs.get(prevLogIndex).getTerm() : lastIncludedTerm;
 
             LogEntry entry = new LogEntry(term, lastLogIndex + 1, newData);
-            logHandler.append(entry); // Append entry to the log
+            logHandler.append(entry);
 
             System.out.println("Leader " + nodeId + " updated data: " + newData);
             rpcHandler.replicateData(nodeId, newData, term, prevLogIndex, prevLogTerm);
@@ -94,15 +112,18 @@ public class RaftNodeImpl extends UnicastRemoteObject implements RaftNode {
 
             List<LogEntry> logs = logHandler.readAll();
 
-            // 🛑 FIX: Handle prevLogIndex -1 (empty log case)
+            // 🛑 Handle case where prevLogIndex is below last snapshot
+            if (prevLogIndex < lastIncludedIndex) {
+                return true; // Already applied
+            }
+
             if (prevLogIndex >= 0) {
                 if (prevLogIndex >= logs.size() || logs.get(prevLogIndex).getTerm() != prevLogTerm) {
-                    System.err.println("❌ Log inconsistency detected! Rejecting entry.");
-                    return false; // Reject if log doesn't match
+                    System.err.println("❌ Log inconsistency detected! Requesting snapshot.");
+                    return false;
                 }
             }
 
-            // Append new entry
             LogEntry entry = new LogEntry(term, prevLogIndex + 1, newData);
             logHandler.append(entry);
             System.out.println("Node " + nodeId + " persisted data from Leader " + leaderId);
@@ -112,7 +133,30 @@ public class RaftNodeImpl extends UnicastRemoteObject implements RaftNode {
         return false;
     }
 
+    private void createSnapshot() {
+        List<LogEntry> logs = logHandler.readAll();
+        if (logs.isEmpty()) return;
 
+        int lastIndex = logs.get(logs.size() - 1).getIndex();
+        int lastTerm = logs.get(logs.size() - 1).getTerm();
+        String state = "Application state at index " + lastIndex;
+
+        snapshotHandler.saveSnapshot(lastIndex, lastTerm, state);
+        logHandler.clearLogs(lastIndex);
+        lastIncludedIndex = lastIndex;
+        lastIncludedTerm = lastTerm;
+    }
+
+    public synchronized void installSnapshot(int term, int lastIncludedIndex, int lastIncludedTerm, String state) {
+        if (term < this.term) return;
+
+        System.out.println("📥 Installing snapshot: Index=" + lastIncludedIndex);
+        snapshotHandler.saveSnapshot(lastIncludedIndex, lastIncludedTerm, state);
+        logHandler.clearLogs(lastIncludedIndex);
+        this.lastIncludedIndex = lastIncludedIndex;
+        this.lastIncludedTerm = lastIncludedTerm;
+        this.data = state;
+    }
 
     private void startElection() {
         term++;
